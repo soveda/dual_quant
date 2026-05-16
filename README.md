@@ -1,128 +1,323 @@
-# dual quantised pitch shifter for MTMWS computer
-Vibe code assissted first try at a programme card for the Music Thing Modular Workshop Computer
-# Dual Quant Pitch
+# DualQuantPitch
 
-Dual quantised granular pitch shifter for the Music Thing Modular Workshop Computer.
+A dual-channel granular pitch shifter for the Workshop Computer platform.
 
-This card creates two independently pitch-shifted versions of the same incoming audio signal while also generating matching calibrated 1V/oct CV outputs.
+This firmware is intentionally lo-fi and texture-focused rather than transparent.
+The pitch shifting is based on overlapping granular delay reads with triangle-windowed grains.
 
-The design embraces the Workshop Computer philosophy:
-- small
-- immediate
-- playable
-- imperfect in musical ways
+The module provides:
 
-The pitch shifting is intentionally grainy and characterful rather than transparent.
-
----
-
-# Controls
-
-| Control | Function |
-|---|---|
-| Main Knob | Global transpose for both outputs (-12 to +12 semitones) |
-| X Knob | Output 1 pitch |
-| Y Knob | Output 2 pitch |
-| CV In 1 | Additional modulation for Output 1 |
-| CV In 2 | Additional modulation for Output 2 |
+* Dual independent pitch-shifted outputs
+* Chromatic pitch quantisation
+* CV-controllable pitch offsets
+* Fixed-point DSP safe for ISR/audio-rate execution
+* Granular texture and overlap artefacts by design
 
 ---
 
-# Switch
+# Features
 
-| Position | Function |
-|---|---|
-| UP | Unquantised |
-| MIDDLE | Quantised |
-| DOWN | Advance scale |
+## Dual granular pitch shifters
 
-Scale changes occur once per switch press.
+Two independent read heads scan a shared circular audio buffer.
 
----
+Each voice:
 
-# Scales
+* Has independent pitch control
+* Uses interpolated sample reads
+* Uses triangle-windowed grains
+* Runs continuously at audio rate
 
-- Major
-- Minor
-- Pentatonic
-- Minor Pentatonic
-- Blues
-- Whole Tone
-- Chromatic
+Outputs:
+
+* AudioOut1 = voice A
+* AudioOut2 = voice B
 
 ---
 
-# LEDs
+# Quantisation
 
-| LED | Scale |
-|---|---|
-| 0 | Major |
-| 1 | Minor |
-| 2 | Pentatonic |
-| 3 | Minor Pentatonic |
-| 4 | Blues |
-| 5 | Whole Tone |
-| All LEDs | Chromatic |
+The quantiser now uses a simplified chromatic-only mode.
 
-In unquantised mode all LEDs glow dimly.
+When enabled:
 
----
+* Incoming pitch values are rounded to the nearest semitone
+* Pitch is represented internally using Q8.8 fixed-point format
+* Quantisation is lightweight and ISR-safe
 
-# Inputs / Outputs
+Quantiser implementation:
 
-| Jack | Function |
-|---|---|
-| Audio/CV In 1 | Audio input |
-| Audio Out 1 | Pitch shifted voice A |
-| Audio Out 2 | Pitch shifted voice B |
-| CV Out 1 | 1V/oct pitch CV for voice A |
-| CV Out 2 | 1V/oct pitch CV for voice B |
+```cpp
+int32_t QuantisePitch(int32_t semitone)
+{
+    if (semitone >= 0)
+    {
+        return ((semitone + 128) >> 8) << 8;
+    }
+    else
+    {
+        return ((semitone - 128) >> 8) << 8;
+    }
+}
+```
 
----
+Switch behaviour:
 
-# DSP Notes
-
-This card uses:
-- shared circular audio buffer
-- dual granular read heads
-- fixed-point DSP
-- integer interpolation
-- crossfaded grains
-
-No floating point math is used inside the audio interrupt.
-
-The result is CPU-efficient and stable on the RP2040 while preserving a rough hardware texture.
+* Middle = quantised chromatic pitch
+* Other positions = continuous pitch
 
 ---
 
-# Building
+# Fixed-point formats
 
-Requires:
-- Pico SDK
-- ComputerCard library
-- RP2040 toolchain
+## Audio playback
 
-Recommended:
-- 144MHz clock
-- copy_to_ram binary type
+Playback position uses Q16.16 fixed point.
 
----
+```text
+upper 16 bits = integer sample index
+lower 16 bits = fractional position
+```
 
-# Known Behaviour
+Examples:
 
-This is not a transparent studio pitch shifter.
-
-Large shifts intentionally:
-- become grainier
-- smear transients
-- develop chorus-like movement
-
-These artefacts are treated as musical character rather than defects.
+```text
+65536  = 1.0
+32768  = 0.5
+131072 = 2.0
+```
 
 ---
 
-# Credits
+## Pitch control
 
-Created for the Music Thing Modular Workshop Computer.
+Pitch values use Q8.8 semitone format.
 
-AI-assisted implementation with human supervision and tuning.
+```text
+256  = 1 semitone
+128  = 0.5 semitone
+-256 = -1 semitone
+```
+
+This allows:
+
+* Smooth unquantised pitch movement
+* Accurate semitone snapping
+* Low-cost integer arithmetic
+
+---
+
+# Pitch control mapping
+
+## Knobs
+
+```text
+0     -> -12 semitones
+2048  -> 0 semitones
+4095  -> +12 semitones
+```
+
+Implementation:
+
+```cpp
+int32_t KnobToSemitones(int32_t value)
+{
+    return (((value << 8) * 24) / 4095) - (12 << 8);
+}
+```
+
+---
+
+## CV input
+
+Approximate mapping:
+
+```text
+1V = 12 semitones
+```
+
+Implementation:
+
+```cpp
+int32_t CVToSemitones(int32_t cv)
+{
+    return ((cv << 8) * 72) / 2048;
+}
+```
+
+---
+
+# Granular engine
+
+## Circular buffer
+
+A shared circular delay buffer stores incoming audio.
+
+```cpp
+static const int32_t BUFFER_SIZE = 2048;
+```
+
+Power-of-two sizing allows fast wraparound:
+
+```cpp
+index & BUFFER_MASK
+```
+
+instead of modulo operations.
+
+---
+
+## Grain size
+
+```cpp
+static const int32_t GRAIN_SIZE = 512;
+```
+
+Larger grains:
+
+* smoother
+* more latency
+* fewer artefacts
+
+Smaller grains:
+
+* rougher
+* more glitchy
+* more rhythmic texture
+
+---
+
+## Interpolation
+
+Linear interpolation smooths movement between samples.
+
+```cpp
+sample =
+    s1 +
+    (((s2 - s1) * frac)
+    >> FP_SHIFT);
+```
+
+---
+
+## Grain envelope
+
+Each grain uses a triangle envelope to reduce clicks.
+
+```text
+fade in -> peak -> fade out
+```
+
+---
+
+# Playback ratios
+
+Playback speed is derived from a fixed lookup table.
+
+This avoids:
+
+* floating point
+* powf()
+* expensive ISR math
+
+Pitch lookup currently supports:
+
+```text
+-12 to +12 semitones
+```
+
+Ratios are indexed using:
+
+```cpp
+int32_t idx = (semitone >> 8) + 12;
+```
+
+---
+
+# CV outputs
+
+Pitch CV outputs are generated in millivolts.
+
+```cpp
+int32_t mvA =
+    ((pitchA >> 8) * 1000) / 12;
+
+int32_t mvB =
+    ((pitchB >> 8) * 1000) / 12;
+```
+
+This converts Q8.8 semitone values back into integer semitone space before voltage scaling.
+
+---
+
+# LED behaviour
+
+## Quantised mode
+
+All LEDs on.
+
+## Continuous mode
+
+All LEDs dim.
+
+---
+
+# ISR safety
+
+Everything inside `ProcessSample()` is designed for real-time ISR execution.
+
+Avoided operations:
+
+* dynamic allocation
+* floating point
+* STL containers
+* blocking operations
+* expensive transcendental functions
+
+The firmware is intended to run safely at:
+
+```text
+48kHz audio rate
+```
+
+with:
+
+```text
+144MHz system clock
+```
+
+---
+
+# Current architecture summary
+
+## Audio format
+
+* 16-bit audio samples
+* Q16.16 playback positions
+* Q8.8 pitch representation
+
+## DSP structure
+
+* Shared circular delay buffer
+* Dual overlapping grains
+* Linear interpolation
+* Triangle grain windows
+* Fixed lookup-table pitch ratios
+* Chromatic semitone quantiser
+
+---
+
+# Known sonic characteristics
+
+This is intentionally not a transparent pitch shifter.
+
+Expected artefacts include:
+
+* granular texture
+* chorus-like motion
+* smearing
+* grain beating
+* rhythmic overlap artefacts
+* transient roughness
+
+These artefacts are considered part of the instrument character.

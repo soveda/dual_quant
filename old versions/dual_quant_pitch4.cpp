@@ -78,7 +78,40 @@ public:
     // Scale definitions
     // ============================================================
 
-  
+    enum Scale
+    {
+        MAJOR,
+        MINOR,
+        PENTATONIC,
+        MINOR_PENTATONIC,
+        BLUES,
+        WHOLE_TONE,
+        CHROMATIC,
+        NUM_SCALES
+    };
+
+    static constexpr int8_t majorScale[7] =
+        {0,2,4,5,7,9,11};
+
+    static constexpr int8_t minorScale[7] =
+        {0,2,3,5,7,8,10};
+
+    static constexpr int8_t pentScale[5] =
+        {0,2,4,7,9};
+
+    static constexpr int8_t minorPentScale[5] =
+        {0,3,5,7,10};
+
+    static constexpr int8_t bluesScale[6] =
+        {0,3,5,6,7,10};
+
+    static constexpr int8_t wholeToneScale[6] =
+        {0,2,4,6,8,10};
+
+    static constexpr int8_t chromaticScale[12] =
+        {0,1,2,3,4,5,6,7,8,9,10,11};
+
+    // ============================================================
     // Audio state
     // ============================================================
 
@@ -92,7 +125,7 @@ public:
     int32_t grainPhaseA = 0;
     int32_t grainPhaseB = HALF_GRAIN;
 
-    
+    Scale currentScale = MAJOR;
 
     // ============================================================
     // Constructor
@@ -122,7 +155,18 @@ public:
         // Switch handling
         // ========================================================
 
-        
+        if (SwitchChanged())
+        {
+            // Rotate scale only when switch moves DOWN.
+            // Prevents repeated scrolling while held.
+
+            if (SwitchVal() == Switch::Down)
+            {
+                currentScale = static_cast<Scale>(
+                    (currentScale + 1) % NUM_SCALES
+                );
+            }
+        }
 
         bool quantised =
             (SwitchVal() == Switch::Middle);
@@ -236,10 +280,10 @@ public:
         // ========================================================
 
         int32_t mvA =
-            ((pitchA >> 8) * 1000) / 12;
-        
+            (pitchA * 1000) / 12;
+
         int32_t mvB =
-            ((pitchB >> 8) * 1000) / 12;
+            (pitchB * 1000) / 12;
 
         CVOut1Millivolts(mvA);
         CVOut2Millivolts(mvB);
@@ -332,8 +376,9 @@ public:
 
     int32_t KnobToSemitones(int32_t value)
     {
-        return (((value << 8) * 24) / 4095) - (12 << 8);
+        return ((value * 24) / 4095) - 12;
     }
+
     // ============================================================
     // CV mapping
     //
@@ -343,28 +388,99 @@ public:
 
     int32_t CVToSemitones(int32_t cv)
     {
-        return ((cv << 8) * 72) / 2048;
+        return (cv * 72) / 2048;
     }
 
     // ============================================================
     // Quantiser
     //
+    // Snaps incoming semitone values to nearest
+    // valid scale degree.
+    //
+    // This behaves like a continuous note selector
+    // rather than chromatic rounding.
+    // ============================================================
 
     int32_t QuantisePitch(int32_t semitone)
     {
-        // Q8.8 fixed-point chromatic quantiser.
-        //
-        // Simply rounds to nearest semitone.
+        int32_t octave = semitone / 12;
 
-        if (semitone >= 0)
+        int32_t note = semitone % 12;
+
+        if (note < 0)
         {
-            return ((semitone + 128) >> 8) << 8;
+            note += 12;
+            octave--;
         }
-        else
+
+        const int8_t* scale;
+        int32_t size;
+
+        switch(currentScale)
         {
-            return ((semitone - 128) >> 8) << 8;
+            case MAJOR:
+                scale = majorScale;
+                size = 7;
+                break;
+
+            case MINOR:
+                scale = minorScale;
+                size = 7;
+                break;
+
+            case PENTATONIC:
+                scale = pentScale;
+                size = 5;
+                break;
+
+            case MINOR_PENTATONIC:
+                scale = minorPentScale;
+                size = 5;
+                break;
+
+            case BLUES:
+                scale = bluesScale;
+                size = 6;
+                break;
+
+            case WHOLE_TONE:
+                scale = wholeToneScale;
+                size = 6;
+                break;
+
+            case CHROMATIC:
+            default:
+                return semitone;
         }
-    
+
+        int32_t nearest = scale[0];
+        int32_t bestDist = 12;
+
+        for (int32_t i = 0; i < size; i++)
+        {
+            int32_t dist =
+                Abs(note - scale[i]);
+
+            // Wraparound correction.
+            //
+            // Example:
+            // distance from 11 -> 0
+            // should be 1 semitone,
+            // not 11 semitones.
+
+            if (dist > 6)
+            {
+                dist = 12 - dist;
+            }
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                nearest = scale[i];
+            }
+        }
+
+        return (octave * 12) + nearest;
     }
 
     // ============================================================
@@ -409,8 +525,8 @@ public:
             131072
         };
 
-        int32_t idx = (semitone >> 8) + 12;
-        
+        int32_t idx = semitone + 12;
+
         if (idx < 0) idx = 0;
         if (idx > 24) idx = 24;
 
@@ -428,20 +544,36 @@ public:
             LedOff(i);
         }
 
-        if (quantised)
+        // Unquantised mode:
+        // dim glow on all LEDs.
+
+        if (!quantised)
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                LedBrightness(i, 128);
+            }
+
+            return;
+        }
+
+        // Chromatic mode:
+        // all LEDs lit.
+
+        if (currentScale == CHROMATIC)
         {
             for (int i = 0; i < 6; i++)
             {
                 LedOn(i);
             }
+
+            return;
         }
-        else
-        {
-            for (int i = 0; i < 6; i++)
-            {
-                LedBrightness(i, 64);
-            }
-        }
+
+        // Other scales:
+        // one-hot LED display.
+
+        LedOn(static_cast<int>(currentScale));
     }
 
     // ============================================================
