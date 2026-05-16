@@ -448,7 +448,7 @@ public:
                 size = 6;
                 break;
 
-            case CHROMATIC:
+            case CHROMATIC
             default:
                 return semitone;
         }
