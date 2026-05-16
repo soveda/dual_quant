@@ -1,323 +1,246 @@
 # DualQuantPitch
 
-A dual-channel granular pitch shifter for the Workshop Computer platform.
+A dual granular pitch shifter for the Workshop Computer platform.
 
-This firmware is intentionally lo-fi and texture-focused rather than transparent.
-The pitch shifting is based on overlapping granular delay reads with triangle-windowed grains.
+This project implements two independent fixed-point granular pitch shifters running entirely inside the audio ISR at 48kHz on RP2040 hardware.
 
-The module provides:
-
-* Dual independent pitch-shifted outputs
-* Chromatic pitch quantisation
-* CV-controllable pitch offsets
-* Fixed-point DSP safe for ISR/audio-rate execution
-* Granular texture and overlap artefacts by design
+The design intentionally embraces a rough, lo-fi granular texture rather than attempting transparent studio-quality pitch shifting.
 
 ---
 
 # Features
 
-## Dual granular pitch shifters
-
-Two independent read heads scan a shared circular audio buffer.
-
-Each voice:
-
-* Has independent pitch control
-* Uses interpolated sample reads
-* Uses triangle-windowed grains
-* Runs continuously at audio rate
-
-Outputs:
-
-* AudioOut1 = voice A
-* AudioOut2 = voice B
+* Dual independent pitch-shifted outputs
+* Shared circular audio buffer
+* Fixed-point DSP throughout
+* No floating point operations inside the ISR
+* No dynamic allocation
+* ISR-safe implementation
+* Optional chromatic pitch quantisation
+* CV-controllable pitch shifting
+* Granular overlap texture
+* Interpolated sample playback
+* Triangle grain windowing
+* Pitch CV outputs
+* LED feedback for quantiser state
 
 ---
 
-# Quantisation
+# Design Goals
 
-The quantiser now uses a simplified chromatic-only mode.
+This module was designed around several constraints:
 
-When enabled:
+* Stable real-time ISR execution
+* Minimal CPU overhead
+* Predictable timing behaviour
+* Low memory usage
+* No blocking operations
+* No expensive transcendental math
+* Musically useful degradation
 
-* Incoming pitch values are rounded to the nearest semitone
-* Pitch is represented internally using Q8.8 fixed-point format
-* Quantisation is lightweight and ISR-safe
+The goal is not perfect transparency.
 
-Quantiser implementation:
+Instead, the module intentionally produces:
 
-```cpp
-int32_t QuantisePitch(int32_t semitone)
-{
-    if (semitone >= 0)
-    {
-        return ((semitone + 128) >> 8) << 8;
-    }
-    else
-    {
-        return ((semitone - 128) >> 8) << 8;
-    }
-}
-```
+* gritty textures
+* grain smearing
+* metallic transients
+* chorus-like motion
+* unstable granular character
 
-Switch behaviour:
+This makes the module particularly suitable for:
 
-* Middle = quantised chromatic pitch
-* Other positions = continuous pitch
-
----
-
-# Fixed-point formats
-
-## Audio playback
-
-Playback position uses Q16.16 fixed point.
-
-```text
-upper 16 bits = integer sample index
-lower 16 bits = fractional position
-```
-
-Examples:
-
-```text
-65536  = 1.0
-32768  = 0.5
-131072 = 2.0
-```
+* drones
+* ambient processing
+* experimental synthesis
+* tape-like pitch artefacts
+* glitch textures
+* modular feedback systems
 
 ---
 
-## Pitch control
+# Architecture
 
-Pitch values use Q8.8 semitone format.
+## Circular Buffer
 
-```text
-256  = 1 semitone
-128  = 0.5 semitone
--256 = -1 semitone
-```
+Incoming audio is written into a shared 2048-sample circular buffer.
 
-This allows:
+Both pitch shifters read from this buffer independently using fixed-point read heads.
 
-* Smooth unquantised pitch movement
-* Accurate semitone snapping
-* Low-cost integer arithmetic
-
----
-
-# Pitch control mapping
-
-## Knobs
-
-```text
-0     -> -12 semitones
-2048  -> 0 semitones
-4095  -> +12 semitones
-```
-
-Implementation:
-
-```cpp
-int32_t KnobToSemitones(int32_t value)
-{
-    return (((value << 8) * 24) / 4095) - (12 << 8);
-}
-```
-
----
-
-## CV input
-
-Approximate mapping:
-
-```text
-1V = 12 semitones
-```
-
-Implementation:
-
-```cpp
-int32_t CVToSemitones(int32_t cv)
-{
-    return ((cv << 8) * 72) / 2048;
-}
-```
-
----
-
-# Granular engine
-
-## Circular buffer
-
-A shared circular delay buffer stores incoming audio.
+Power-of-two buffer sizing allows efficient wrapping using bitmask operations instead of modulo arithmetic.
 
 ```cpp
 static const int32_t BUFFER_SIZE = 2048;
+static const int32_t BUFFER_MASK = BUFFER_SIZE - 1;
 ```
-
-Power-of-two sizing allows fast wraparound:
-
-```cpp
-index & BUFFER_MASK
-```
-
-instead of modulo operations.
 
 ---
 
-## Grain size
+## Fixed-Point Format
 
-```cpp
-static const int32_t GRAIN_SIZE = 512;
-```
+The DSP engine uses Q16.16 fixed-point arithmetic.
 
-Larger grains:
+* Upper 16 bits: integer component
+* Lower 16 bits: fractional component
 
-* smoother
-* more latency
-* fewer artefacts
+Examples:
 
-Smaller grains:
+| Value  | Meaning |
+| ------ | ------- |
+| 65536  | 1.0     |
+| 32768  | 0.5     |
+| 131072 | 2.0     |
 
-* rougher
-* more glitchy
-* more rhythmic texture
+Pitch values use Q8.8 fixed-point semitone representation.
+
+---
+
+## Granular Playback
+
+Each output continuously reads through the delay buffer at a variable playback rate.
+
+Read heads are periodically reset behind the write head to create overlapping grains.
+
+This prevents uncontrolled drift while intentionally producing granular artefacts.
 
 ---
 
 ## Interpolation
 
-Linear interpolation smooths movement between samples.
+Linear interpolation smooths playback between adjacent samples.
 
 ```cpp
-sample =
-    s1 +
-    (((s2 - s1) * frac)
-    >> FP_SHIFT);
+sample = s1 + (((s2 - s1) * frac) >> FP_SHIFT);
 ```
+
+64-bit intermediate multiplication is used to avoid overflow.
 
 ---
 
-## Grain envelope
+## Grain Window
 
-Each grain uses a triangle envelope to reduce clicks.
+Each grain uses a triangle amplitude envelope.
 
-```text
-fade in -> peak -> fade out
-```
+This reduces hard discontinuities at grain boundaries and helps minimise clicks.
 
----
-
-# Playback ratios
-
-Playback speed is derived from a fixed lookup table.
-
-This avoids:
-
-* floating point
-* powf()
-* expensive ISR math
-
-Pitch lookup currently supports:
-
-```text
--12 to +12 semitones
-```
-
-Ratios are indexed using:
-
-```cpp
-int32_t idx = (semitone >> 8) + 12;
-```
+The implementation uses shift operations instead of integer division for ISR efficiency.
 
 ---
 
-# CV outputs
+# Controls
 
-Pitch CV outputs are generated in millivolts.
-
-```cpp
-int32_t mvA =
-    ((pitchA >> 8) * 1000) / 12;
-
-int32_t mvB =
-    ((pitchB >> 8) * 1000) / 12;
-```
-
-This converts Q8.8 semitone values back into integer semitone space before voltage scaling.
+| Control                | Function                                 |
+| ---------------------- | ---------------------------------------- |
+| Main knob              | Global pitch offset                      |
+| X knob                 | Pitch offset for output A                |
+| Y knob                 | Pitch offset for output B                |
+| CV input 1             | Additional pitch modulation for output A |
+| CV input 2             | Additional pitch modulation for output B |
+| Switch middle position | Enable chromatic quantisation            |
 
 ---
 
-# LED behaviour
+# Outputs
 
-## Quantised mode
-
-All LEDs on.
-
-## Continuous mode
-
-All LEDs dim.
-
----
-
-# ISR safety
-
-Everything inside `ProcessSample()` is designed for real-time ISR execution.
-
-Avoided operations:
-
-* dynamic allocation
-* floating point
-* STL containers
-* blocking operations
-* expensive transcendental functions
-
-The firmware is intended to run safely at:
-
-```text
-48kHz audio rate
-```
-
-with:
-
-```text
-144MHz system clock
-```
+| Output      | Function                  |
+| ----------- | ------------------------- |
+| Audio Out 1 | Pitch-shifted signal A    |
+| Audio Out 2 | Pitch-shifted signal B    |
+| CV Out 1    | Quantised pitch voltage A |
+| CV Out 2    | Quantised pitch voltage B |
 
 ---
 
-# Current architecture summary
+# Quantiser
 
-## Audio format
+The quantiser uses fixed-point chromatic rounding.
 
-* 16-bit audio samples
-* Q16.16 playback positions
-* Q8.8 pitch representation
+Pitch values are represented in Q8.8 semitone format.
 
-## DSP structure
-
-* Shared circular delay buffer
-* Dual overlapping grains
-* Linear interpolation
-* Triangle grain windows
-* Fixed lookup-table pitch ratios
-* Chromatic semitone quantiser
+The implementation correctly handles negative semitone values.
 
 ---
 
-# Known sonic characteristics
+# Playback Ratios
 
-This is intentionally not a transparent pitch shifter.
+Pitch shifting uses a precomputed ratio lookup table.
 
-Expected artefacts include:
+This avoids expensive floating-point operations such as `powf()` inside the ISR.
 
-* granular texture
-* chorus-like motion
-* smearing
-* grain beating
-* rhythmic overlap artefacts
-* transient roughness
+Ratios are intentionally approximate and musically tuned.
 
-These artefacts are considered part of the instrument character.
+---
+
+# Performance
+
+The audio ISR runs at 48kHz.
+
+Design optimisations include:
+
+* fixed-point arithmetic
+* lookup tables
+* power-of-two buffer wrapping
+* shift-based envelope calculations
+* no heap allocation
+* no floating point
+* no modulo operations in hot paths
+
+The system clock is configured to 144MHz to provide stable DSP headroom.
+
+---
+
+# Audio Character
+
+Expected sonic characteristics:
+
+* rough granular texture
+* transient smearing
+* grain overlap modulation
+* metallic artefacts
+* pitch instability at extreme shifts
+* chorus-like motion at smaller intervals
+
+The implementation intentionally prioritises character over transparency.
+
+---
+
+# Safety Notes
+
+The DSP engine includes:
+
+* startup buffer initialisation
+* bounded circular addressing
+* overflow-safe interpolation
+* saturated output clamping
+* deterministic ISR execution
+
+All processing is designed to remain ISR-safe.
+
+---
+
+# Future Improvements
+
+Potential future enhancements:
+
+* alternative grain windows
+* equal-power overlap curves
+* stereo grain decorrelation
+* feedback paths
+* freeze mode
+* reverse grains
+* pitch scale selection
+* microtonal quantisation
+* grain jitter modulation
+* clock-synchronised grain resets
+
+---
+
+# License
+
+MIT License
+
+---
+
+# Author
+
+Created by Adrian Vos
