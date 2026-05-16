@@ -1,7 +1,0 @@
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/picotool
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/picotoolTargets.cmake
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/picotoolTargets-release.cmake
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/picotoolConfig.cmake
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/picotoolConfigVersion.cmake
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/enc_bootloader.elf
-/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool/enc_bootloader_mbedtls.elf
