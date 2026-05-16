@@ -1,5 +1,7 @@
 # DualQuantPitch
 
+This Readme is LLM output
+
 A dual granular pitch shifter for the Workshop Computer platform.
 
 This project implements two independent fixed-point granular pitch shifters running entirely inside the audio ISR at 48kHz on RP2040 hardware.
@@ -235,12 +237,9 @@ Potential future enhancements:
 
 ---
 
-# License
 
-MIT License
-
----
 
 # Author
 
 Created by Adrian Vos
+Much thanks to Tom Whitwell for making all this possible, Chris Johnson for the ComputerCard framework and inspiration and everyone on the Workshop System Discord for the encouragement.
