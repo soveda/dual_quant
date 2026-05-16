@@ -201,17 +201,8 @@ public:
             ReadInterpolated(readHeadB,
                              grainPhaseB);
 
-        // Prevent overflow/clipping
-
-        if (outA > 32767) outA = 32767;
-        if (outA < -32768) outA = -32768;
-
-        if (outB > 32767) outB = 32767;
-        if (outB < -32768) outB = -32768;
-
         AudioOut1(outA);
         AudioOut2(outB);
-        
 
         // ========================================================
         // Advance read heads
@@ -312,7 +303,7 @@ public:
 
         int32_t sample =
             s1 +
-            ((int64_t)(s2 - s1) * frac
+            (((s2 - s1) * frac)
             >> FP_SHIFT);
 
         // ========================================================
@@ -335,7 +326,7 @@ public:
                 / HALF_GRAIN;
         }
 
-        return ((int64_t)sample * env) >> 12;
+        return (sample * env) >> 12;
     }
 
     // ============================================================

@@ -85,13 +85,8 @@ public:
 
     int32_t writeHead = 0;
 
-    int32_t readHeadA =
-        (-GRAIN_SIZE & BUFFER_MASK)
-        << FP_SHIFT;
-    int32_t readHeadB =
-    ((-GRAIN_SIZE - HALF_GRAIN)
-     & BUFFER_MASK)
-    << FP_SHIFT;
+    int32_t readHeadA = 0;
+    int32_t readHeadB = (-HALF_GRAIN & BUFFER_MASK) << FP_SHIFT;
 
     int32_t grainPhaseA = 0;
     int32_t grainPhaseB = HALF_GRAIN;
@@ -110,11 +105,6 @@ public:
         // - reduced noise artefacts
 
         set_sys_clock_khz(144000, true);
-        
-        for (int i = 0; i < BUFFER_SIZE; i++)
-        {
-            audioBuffer[i] = 0;
-        }
     }
 
     // ============================================================
@@ -201,17 +191,8 @@ public:
             ReadInterpolated(readHeadB,
                              grainPhaseB);
 
-        // Prevent overflow/clipping
-
-        if (outA > 32767) outA = 32767;
-        if (outA < -32768) outA = -32768;
-
-        if (outB > 32767) outB = 32767;
-        if (outB < -32768) outB = -32768;
-
         AudioOut1(outA);
         AudioOut2(outB);
-        
 
         // ========================================================
         // Advance read heads
@@ -312,7 +293,7 @@ public:
 
         int32_t sample =
             s1 +
-            ((int64_t)(s2 - s1) * frac
+            (((s2 - s1) * frac)
             >> FP_SHIFT);
 
         // ========================================================
@@ -335,7 +316,7 @@ public:
                 / HALF_GRAIN;
         }
 
-        return ((int64_t)sample * env) >> 12;
+        return (sample * env) >> 12;
     }
 
     // ============================================================
@@ -372,14 +353,14 @@ public:
         //
         // Simply rounds to nearest semitone.
 
-        int32_t q =
-               (semitone >= 0)
-               ? (semitone + 128)
-               : (semitone - 128);
-
-           int32_t semi = q / 256;
-
-           return semi * 256;
+        if (semitone >= 0)
+        {
+            return ((semitone + 128) >> 8) << 8;
+        }
+        else
+        {
+            return ((semitone - 128) >> 8) << 8;
+        }
     
     }
 
@@ -416,14 +397,8 @@ public:
             220436, 233544, 247432, 262144
         };
 
-        int32_t semi = semitone / 256;
-        int32_t frac = semitone % 256;
-
-        if (frac < 0)
-        {
-            frac += 256;
-            semi -= 1;
-        }
+        int32_t semi = semitone >> 8;
+        int32_t frac = semitone & 0xFF;
 
         if (semi < -24)
         {

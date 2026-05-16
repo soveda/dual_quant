@@ -43,7 +43,8 @@ public:
     // ============================================================
 
     static const int32_t FP_SHIFT = 16;
-   
+    static const int32_t FP_ONE   = 1 << FP_SHIFT;
+
     // ============================================================
     // Circular audio buffer
     //
@@ -85,13 +86,8 @@ public:
 
     int32_t writeHead = 0;
 
-    int32_t readHeadA =
-        (-GRAIN_SIZE & BUFFER_MASK)
-        << FP_SHIFT;
-    int32_t readHeadB =
-    ((-GRAIN_SIZE - HALF_GRAIN)
-     & BUFFER_MASK)
-    << FP_SHIFT;
+    int32_t readHeadA = 0;
+    int32_t readHeadB = HALF_GRAIN << FP_SHIFT;
 
     int32_t grainPhaseA = 0;
     int32_t grainPhaseB = HALF_GRAIN;
@@ -110,11 +106,6 @@ public:
         // - reduced noise artefacts
 
         set_sys_clock_khz(144000, true);
-        
-        for (int i = 0; i < BUFFER_SIZE; i++)
-        {
-            audioBuffer[i] = 0;
-        }
     }
 
     // ============================================================
@@ -201,17 +192,8 @@ public:
             ReadInterpolated(readHeadB,
                              grainPhaseB);
 
-        // Prevent overflow/clipping
-
-        if (outA > 32767) outA = 32767;
-        if (outA < -32768) outA = -32768;
-
-        if (outB > 32767) outB = 32767;
-        if (outB < -32768) outB = -32768;
-
         AudioOut1(outA);
         AudioOut2(outB);
-        
 
         // ========================================================
         // Advance read heads
@@ -242,7 +224,9 @@ public:
             grainPhaseB = 0;
 
             readHeadB =
-                ((writeHead - GRAIN_SIZE - HALF_GRAIN)
+                ((writeHead
+                - GRAIN_SIZE
+                - HALF_GRAIN)
                 & BUFFER_MASK)
                 << FP_SHIFT;
         }
@@ -312,7 +296,7 @@ public:
 
         int32_t sample =
             s1 +
-            ((int64_t)(s2 - s1) * frac
+            (((s2 - s1) * frac)
             >> FP_SHIFT);
 
         // ========================================================
@@ -335,7 +319,7 @@ public:
                 / HALF_GRAIN;
         }
 
-        return ((int64_t)sample * env) >> 12;
+        return (sample * env) >> 12;
     }
 
     // ============================================================
@@ -359,7 +343,7 @@ public:
 
     int32_t CVToSemitones(int32_t cv)
     {
-        return ((cv << 8) * 48) / 2048;
+        return ((cv << 8) * 72) / 2048;
     }
 
     // ============================================================
@@ -372,14 +356,14 @@ public:
         //
         // Simply rounds to nearest semitone.
 
-        int32_t q =
-               (semitone >= 0)
-               ? (semitone + 128)
-               : (semitone - 128);
-
-           int32_t semi = q / 256;
-
-           return semi * 256;
+        if (semitone >= 0)
+        {
+            return ((semitone + 128) >> 8) << 8;
+        }
+        else
+        {
+            return ((semitone - 128) >> 8) << 8;
+        }
     
     }
 
@@ -396,51 +380,41 @@ public:
 
     int32_t SemitoneToRatio(int32_t semitone)
     {
-        static const int32_t ratios[49] =
+        static const int32_t ratios[25] =
         {
-            16384, 17358, 18390, 19484,
-            20642, 21870, 23170, 24548,
-            26008, 27554, 29193, 30929,
             32768,
-
-            34716, 36780, 38967, 41285,
-            43740, 46341, 49096, 52016,
-            55109, 58386, 61858, 65536,
-
-            69433, 73561, 77935, 82570,
-            87480, 92682, 98192, 104032,
-            110218, 116772, 123716, 131072,
-
-            138865, 147122, 155870, 165140,
-            174960, 185364, 196384, 208064,
-            220436, 233544, 247432, 262144
+            34716,
+            36780,
+            38967,
+            41285,
+            43740,
+            46341,
+            49096,
+            52016,
+            55109,
+            58386,
+            61858,
+            65536,
+            69433,
+            73561,
+            77935,
+            82570,
+            87480,
+            92682,
+            98192,
+            104032,
+            110218,
+            116772,
+            123716,
+            131072
         };
 
-        int32_t semi = semitone / 256;
-        int32_t frac = semitone % 256;
+        int32_t idx = (semitone >> 8) + 12;
+        
+        if (idx < 0) idx = 0;
+        if (idx > 24) idx = 24;
 
-        if (frac < 0)
-        {
-            frac += 256;
-            semi -= 1;
-        }
-
-        if (semi < -24)
-        {
-            semi = -24;
-            frac = 0;
-        }
-
-        if (semi >= 24)
-        {
-            semi = 23;
-            frac = 255;
-        }
-
-        int32_t r1 = ratios[semi + 24];
-        int32_t r2 = ratios[semi + 25];
-
-        return r1 + (((r2 - r1) * frac) >> 8);
+        return ratios[idx];
     }
 
     // ============================================================
@@ -470,9 +444,14 @@ public:
         }
     }
 
-    // ==========================================================
+    // ============================================================
+    // Integer absolute value
+    // ============================================================
 
-    
+    int32_t Abs(int32_t x)
+    {
+        return (x < 0) ? -x : x;
+    }
 };
 
 int main()
