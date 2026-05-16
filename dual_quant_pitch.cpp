@@ -1,353 +1,273 @@
-// ============================================================
-// Dual Quant Pitch
 //
-// Workshop Computer program card for:
+//  DualQuantPitch.cpp
 //
-// - Dual pitch-shifted outputs
-// - Independent pitch control
-// - Quantised interval selection
-// - CV-controlled pitch offsets
-// - Proper overlapping-grain pitch shifting
 //
-// Designed for:
-// Music Thing Modular Workshop Computer
-// ComputerCard v0.3.0+
+//  Created by Adrian Vos on 16/05/2026.
 //
-// ============================================================
+
 
 #include "ComputerCard.h"
-
-#include <math.h>
-#include <stdint.h>
+#include "pico/stdlib.h"
+#include "hardware/clocks.h"
 
 class DualQuantPitch : public ComputerCard
 {
 public:
 
-    // ========================================================
-    // Audio buffer configuration
-    // ========================================================
+    // ============================================================
+    // Workshop Computer granular pitch shifter
+    //
+    // The goal here is not perfect transparency.
+    // We intentionally embrace a rough granular texture.
+    //
+    // Everything inside ProcessSample() must remain ISR-safe:
+    // - no floats
+    // - no dynamic allocation
+    // - no expensive library calls
+    // - no blocking operations
+    //
+    // ============================================================
+
+    // ============================================================
+    // Fixed-point format
+    //
+    // Q16.16:
+    // upper 16 bits = integer
+    // lower 16 bits = fraction
+    //
+    // Example:
+    // 65536 = 1.0
+    // 32768 = 0.5
+    // 131072 = 2.0
+    //
+    // ============================================================
+
+    static const int32_t FP_SHIFT = 16;
+    static const int32_t FP_ONE   = 1 << FP_SHIFT;
+
+    // ============================================================
+    // Circular audio buffer
+    //
+    // Shared between both pitch shifters.
+    //
+    // Power-of-two size allows very fast wrapping
+    // using bitmask operations instead of modulo.
+    //
+    // ============================================================
 
     static const int32_t BUFFER_SIZE = 2048;
     static const int32_t BUFFER_MASK = BUFFER_SIZE - 1;
 
-    // ========================================================
-    // Larger grains improve pitch clarity and reduce
-    // dry-signal bleed.
-    // ========================================================
+    // ============================================================
+    // Grain settings
+    //
+    // Larger grains:
+    // - smoother
+    // - more latency
+    //
+    // Smaller grains:
+    // - rougher
+    // - more glitchy
+    //
+    // ============================================================
 
-    static const int32_t GRAIN_SIZE = 1024;
-    static const int32_t HALF_GRAIN = 512;
+    static const int32_t GRAIN_SIZE = 512;
+    static const int32_t HALF_GRAIN = 256;
 
-    // ========================================================
-    // Fixed-point precision
-    // ========================================================
+    // ============================================================
+    // Scale definitions
+    // ============================================================
 
-    static const int32_t FP_SHIFT = 16;
-    static const int32_t FP_ONE = 1 << FP_SHIFT;
+    enum Scale
+    {
+        MAJOR,
+        MINOR,
+        PENTATONIC,
+        MINOR_PENTATONIC,
+        BLUES,
+        WHOLE_TONE,
+        CHROMATIC,
+        NUM_SCALES
+    };
 
-    // ========================================================
-    // Circular audio buffer
-    // ========================================================
+    static constexpr int8_t majorScale[7] =
+        {0,2,4,5,7,9,11};
+
+    static constexpr int8_t minorScale[7] =
+        {0,2,3,5,7,8,10};
+
+    static constexpr int8_t pentScale[5] =
+        {0,2,4,7,9};
+
+    static constexpr int8_t minorPentScale[5] =
+        {0,3,5,7,10};
+
+    static constexpr int8_t bluesScale[6] =
+        {0,3,5,6,7,10};
+
+    static constexpr int8_t wholeToneScale[6] =
+        {0,2,4,6,8,10};
+
+    static constexpr int8_t chromaticScale[12] =
+        {0,1,2,3,4,5,6,7,8,9,10,11};
+
+    // ============================================================
+    // Audio state
+    // ============================================================
 
     int16_t audioBuffer[BUFFER_SIZE];
 
-    volatile int32_t writeHead = 0;
+    int32_t writeHead = 0;
 
-    // ========================================================
-    // Hann window lookup table
-    //
-    // 4096 = unity gain
-    // ========================================================
+    int32_t readHeadA = 0;
+    int32_t readHeadB = HALF_GRAIN << FP_SHIFT;
 
-    int16_t hannWindow[GRAIN_SIZE];
+    int32_t grainPhaseA = 0;
+    int32_t grainPhaseB = HALF_GRAIN;
 
-    // ========================================================
-    // Grain structures
-    // ========================================================
+    Scale currentScale = MAJOR;
 
-    struct Grain
-    {
-        int32_t readHead;
-        int32_t phase;
-    };
-
-    struct Voice
-    {
-        Grain grain1;
-        Grain grain2;
-    };
-
-    Voice voiceA;
-    Voice voiceB;
-
-    // ========================================================
-    // Scale selection
-    // ========================================================
-
-    int32_t currentScale = 0;
-
-    // ========================================================
-    // Scale definitions
-    // ========================================================
-
-    static const int32_t SCALE_COUNT = 6;
-
-    static const int32_t majorScale[7];
-    static const int32_t minorScale[7];
-    static const int32_t pentScale[5];
-    static const int32_t minorPentScale[5];
-    static const int32_t bluesScale[6];
-    static const int32_t wholeToneScale[6];
-
-    // ========================================================
+    // ============================================================
     // Constructor
-    // ========================================================
+    // ============================================================
 
     DualQuantPitch()
     {
-        // ====================================================
-        // Build Hann window lookup table.
-        //
-        // Done once at startup.
-        // Float usage here is acceptable because this
-        // does NOT run in the audio ISR.
-        // ====================================================
+        // 144MHz is a good balance between:
+        // - CPU headroom
+        // - ADC stability
+        // - reduced noise artefacts
 
-        for (int32_t i = 0; i < GRAIN_SIZE; i++)
-        {
-            float phase =
-                (2.0f * 3.14159265f * i)
-                / (GRAIN_SIZE - 1);
-
-            float w =
-                0.5f * (1.0f - cosf(phase));
-
-            hannWindow[i] =
-                static_cast<int16_t>(w * 4096.0f);
-        }
-
-        // ====================================================
-        // Voice A
-        // ====================================================
-
-        voiceA.grain1.phase = 0;
-        voiceA.grain2.phase = HALF_GRAIN;
-
-        voiceA.grain1.readHead = 0;
-        voiceA.grain2.readHead =
-            HALF_GRAIN << FP_SHIFT;
-
-        // ====================================================
-        // Voice B
-        //
-        // Offset read heads to decorrelate outputs.
-        // ====================================================
-
-        voiceB.grain1.phase = 0;
-        voiceB.grain2.phase = HALF_GRAIN;
-
-        voiceB.grain1.readHead =
-            (BUFFER_SIZE / 3)
-            << FP_SHIFT;
-
-        voiceB.grain2.readHead =
-            ((BUFFER_SIZE / 3)
-            + HALF_GRAIN)
-            << FP_SHIFT;
+        set_sys_clock_khz(144000, true);
     }
 
-    // ========================================================
-    // Convert semitone offset into playback ratio
+    // ============================================================
+    // Main audio ISR
     //
-    // Ratio stored as Q16 fixed-point.
-    // ========================================================
-
-    int32_t SemitoneToRatio(
-        int32_t semitone)
-    {
-        float ratio =
-            powf(
-                2.0f,
-                semitone / 12.0f
-            );
-
-        return
-            static_cast<int32_t>(
-                ratio * FP_ONE
-            );
-    }
-
-    // ========================================================
-    // Quantise semitone value to scale
+    // Runs at 48kHz.
     //
-    // Behaves like a continuous note selector snapped
-    // to nearest scale degree.
-    // ========================================================
+    // This must complete in under ~20 microseconds.
+    // ============================================================
 
-    int32_t QuantiseSemitone(
-        int32_t semitone)
+    virtual void ProcessSample()
     {
-        const int32_t* scale = majorScale;
-        int32_t scaleLength = 7;
+        // ========================================================
+        // Switch handling
+        // ========================================================
 
-        switch (currentScale)
+        if (SwitchChanged())
         {
-            case 0:
-                scale = majorScale;
-                scaleLength = 7;
-                break;
+            // Rotate scale only when switch moves DOWN.
+            // Prevents repeated scrolling while held.
 
-            case 1:
-                scale = minorScale;
-                scaleLength = 7;
-                break;
-
-            case 2:
-                scale = pentScale;
-                scaleLength = 5;
-                break;
-
-            case 3:
-                scale = minorPentScale;
-                scaleLength = 5;
-                break;
-
-            case 4:
-                scale = bluesScale;
-                scaleLength = 6;
-                break;
-
-            case 5:
-                scale = wholeToneScale;
-                scaleLength = 6;
-                break;
-        }
-
-        int32_t octave =
-            semitone / 12;
-
-        int32_t note =
-            semitone % 12;
-
-        if (note < 0)
-        {
-            note += 12;
-            octave--;
-        }
-
-        int32_t best =
-            scale[0];
-
-        int32_t bestDistance =
-            99;
-
-        for (int32_t i = 0;
-             i < scaleLength;
-             i++)
-        {
-            int32_t d =
-                abs(note - scale[i]);
-
-            if (d < bestDistance)
+            if (SwitchVal() == Switch::Down)
             {
-                bestDistance = d;
-                best = scale[i];
+                currentScale = static_cast<Scale>(
+                    (currentScale + 1) % NUM_SCALES
+                );
             }
         }
 
-        return
-            (octave * 12)
-            + best;
-    }
+        bool quantised =
+            (SwitchVal() == Switch::Middle);
 
-    // ========================================================
-    // Convert knob/CV pair into semitone range
-    //
-    // -12 semitones fully CCW
-    // +12 semitones fully CW
-    // ========================================================
+        // ========================================================
+        // Audio input
+        // ========================================================
 
-    int32_t PitchControl(
-        int32_t knob,
-        int32_t cv)
-    {
-        int32_t summed =
-            knob + cv;
+        int32_t input = AudioIn1();
 
-        if (summed < 0)
-            summed = 0;
+        // Store incoming audio in circular delay buffer.
 
-        if (summed > 4095)
-            summed = 4095;
+        audioBuffer[writeHead] = input;
 
-        return
-            ((summed - 2048) * 24)
-            / 4096;
-    }
+        // ========================================================
+        // Read controls
+        // ========================================================
 
-    // ========================================================
-    // Render one grain
-    // ========================================================
+        int32_t mainPitch =
+            KnobToSemitones(
+                KnobVal(Knob::Main)
+            );
 
-    int32_t RenderGrain(
-        Grain& grain,
-        int32_t ratio)
-    {
-        // ====================================================
-        // Read interpolated sample
-        // ====================================================
+        int32_t pitchA =
+            mainPitch +
+            KnobToSemitones(
+                KnobVal(Knob::X)
+            ) +
+            CVToSemitones(CVIn1());
 
-        int32_t index =
-            (grain.readHead >> FP_SHIFT)
-            & BUFFER_MASK;
+        int32_t pitchB =
+            mainPitch +
+            KnobToSemitones(
+                KnobVal(Knob::Y)
+            ) +
+            CVToSemitones(CVIn2());
 
-        int32_t frac =
-            grain.readHead
-            & 0xFFFF;
+        // ========================================================
+        // Quantisation
+        // ========================================================
 
-        int32_t s1 =
-            audioBuffer[index];
-
-        int32_t s2 =
-            audioBuffer[
-                (index + 1)
-                & BUFFER_MASK
-            ];
-
-        int32_t sample =
-            s1 +
-            (((s2 - s1)
-            * frac)
-            >> FP_SHIFT);
-
-        // ====================================================
-        // Apply Hann envelope
-        // ====================================================
-
-        int32_t env =
-            hannWindow[grain.phase];
-
-        sample =
-            (sample * env)
-            >> 12;
-
-        // ====================================================
-        // Advance playback
-        // ====================================================
-
-        grain.readHead += ratio;
-        grain.phase++;
-
-        // ====================================================
-        // Restart grain when complete
-        // ====================================================
-
-        if (grain.phase >= GRAIN_SIZE)
+        if (quantised)
         {
-            grain.phase = 0;
+            pitchA = QuantisePitch(pitchA);
+            pitchB = QuantisePitch(pitchB);
+        }
 
-            grain.readHead =
+        // ========================================================
+        // Convert semitones to playback ratios
+        // ========================================================
+
+        int32_t ratioA =
+            SemitoneToRatio(pitchA);
+
+        int32_t ratioB =
+            SemitoneToRatio(pitchB);
+
+        // ========================================================
+        // Generate audio
+        // ========================================================
+
+        int32_t outA =
+            ReadInterpolated(readHeadA,
+                             grainPhaseA);
+
+        int32_t outB =
+            ReadInterpolated(readHeadB,
+                             grainPhaseB);
+
+        AudioOut1(outA);
+        AudioOut2(outB);
+
+        // ========================================================
+        // Advance read heads
+        // ========================================================
+
+        readHeadA += ratioA;
+        readHeadB += ratioB;
+
+        grainPhaseA++;
+        grainPhaseB++;
+
+        // Restart grains periodically.
+        // This prevents runaway drift and creates
+        // the granular overlap texture.
+
+        if (grainPhaseA >= GRAIN_SIZE)
+        {
+            grainPhaseA = 0;
+
+            readHeadA =
+                ((writeHead - GRAIN_SIZE)
+                & BUFFER_MASK)
+                << FP_SHIFT;
+        }
+
+        if (grainPhaseB >= GRAIN_SIZE)
+        {
+            grainPhaseB = 0;
+
+            readHeadB =
                 ((writeHead
                 - GRAIN_SIZE
                 - HALF_GRAIN)
@@ -355,282 +275,319 @@ public:
                 << FP_SHIFT;
         }
 
-        return sample;
-    }
-
-    // ========================================================
-    // Render one complete voice
-    // ========================================================
-
-    int32_t RenderVoice(
-        Voice& voice,
-        int32_t ratio)
-    {
-        int32_t out = 0;
-
-        out +=
-            RenderGrain(
-                voice.grain1,
-                ratio
-            );
-
-        out +=
-            RenderGrain(
-                voice.grain2,
-                ratio
-            );
-
-        // Prevent clipping.
-
-        out >>= 1;
-
-        return out;
-    }
-
-    // ========================================================
-    // LED scale display
-    // ========================================================
-
-    void UpdateLEDs(
-        bool quantised)
-    {
-        for (int32_t i = 0;
-             i < 6;
-             i++)
-        {
-            LedOff(i);
-        }
-
-        // ====================================================
-        // Top-left LED lights when quantiser enabled.
-        // ====================================================
-
-        LedOn(0, quantised);
-
-        // ====================================================
-        // Remaining LEDs show scale index.
-        // ====================================================
-
-        for (int32_t i = 0;
-             i < currentScale;
-             i++)
-        {
-            LedBrightness(
-                i + 1,
-                4095
-            );
-        }
-    }
-
-    // ========================================================
-    // Main audio ISR
-    //
-    // MUST remain fast and deterministic.
-    // ========================================================
-
-    virtual void ProcessSample()
-    {
-        // ====================================================
-        // Read incoming audio
-        // ====================================================
-
-        int32_t input =
-            AudioIn1();
-
-        // ====================================================
-        // Store into circular delay buffer
-        // ====================================================
-
-        audioBuffer[writeHead] =
-            input;
-
-        writeHead =
-            (writeHead + 1)
-            & BUFFER_MASK;
-
-        // ====================================================
-        // Read controls
-        // ====================================================
-
-        int32_t mainTranspose =
-            PitchControl(
-                KnobVal(Knob::Main),
-                2048
-            );
-
-        int32_t pitchA =
-            PitchControl(
-                KnobVal(Knob::X),
-                CVIn1() + 2048
-            );
-
-        int32_t pitchB =
-            PitchControl(
-                KnobVal(Knob::Y),
-                CVIn2() + 2048
-            );
-
-        pitchA += mainTranspose;
-        pitchB += mainTranspose;
-
-        // ====================================================
-        // Switch handling
-        //
-        // Up     = unquantised
-        // Middle = quantised
-        // Down   = rotate scales
-        // ====================================================
-
-        bool quantised = false;
-
-        int32_t sw =
-            SwitchVal();
-
-        if (sw == Switch::Middle)
-        {
-            quantised = true;
-        }
-
-        if (sw == Switch::Down
-            && SwitchChanged())
-        {
-            currentScale++;
-
-            if (currentScale
-                >= SCALE_COUNT)
-            {
-                currentScale = 0;
-            }
-        }
-
-        // ====================================================
-        // Quantise pitch if enabled
-        // ====================================================
-
-        if (quantised)
-        {
-            pitchA =
-                QuantiseSemitone(
-                    pitchA
-                );
-
-            pitchB =
-                QuantiseSemitone(
-                    pitchB
-                );
-        }
-
-        // ====================================================
-        // Convert to playback ratios
-        // ====================================================
-
-        int32_t ratioA =
-            SemitoneToRatio(
-                pitchA
-            );
-
-        int32_t ratioB =
-            SemitoneToRatio(
-                pitchB
-            );
-
-        // ====================================================
-        // Render pitch-shifted outputs
-        // ====================================================
-
-        int32_t outA =
-            RenderVoice(
-                voiceA,
-                ratioA
-            );
-
-        int32_t outB =
-            RenderVoice(
-                voiceB,
-                ratioB
-            );
-
-        // ====================================================
-        // Audio outputs
-        // ====================================================
-
-        AudioOut1(outA);
-        AudioOut2(outB);
-
-        // ====================================================
-        // CV outputs
-        //
-        // Proper calibrated 1V/oct behaviour.
-        //
-        // 1 semitone = 83.333mV
-        // ====================================================
+        // ========================================================
+        // Calibrated pitch CV outputs
+        // ========================================================
 
         int32_t mvA =
-            pitchA * 83;
+            (pitchA * 1000) / 12;
 
         int32_t mvB =
-            pitchB * 83;
+            (pitchB * 1000) / 12;
 
         CVOut1Millivolts(mvA);
         CVOut2Millivolts(mvB);
 
-        // ====================================================
+        // ========================================================
         // LED UI
-        // ====================================================
+        // ========================================================
 
         UpdateLEDs(quantised);
+
+        // ========================================================
+        // Advance circular buffer
+        // ========================================================
+
+        writeHead =
+            (writeHead + 1)
+            & BUFFER_MASK;
+    }
+
+    // ============================================================
+    // Granular read function
+    //
+    // Reads interpolated samples from the delay buffer
+    // and applies a triangle window.
+    //
+    // The window smooths grain transitions and reduces
+    // hard clicks.
+    // ============================================================
+
+    int32_t ReadInterpolated(
+        int32_t readHead,
+        int32_t phase)
+    {
+        int32_t index =
+            (readHead >> FP_SHIFT)
+            & BUFFER_MASK;
+
+        int32_t frac =
+            readHead & 0xFFFF;
+
+        int32_t s1 = audioBuffer[index];
+
+        int32_t s2 =
+            audioBuffer[
+                (index + 1)
+                & BUFFER_MASK
+            ];
+
+        // ========================================================
+        // Linear interpolation
+        //
+        // This smooths movement between samples.
+        // ========================================================
+
+        int32_t sample =
+            s1 +
+            (((s2 - s1) * frac)
+            >> FP_SHIFT);
+
+        // ========================================================
+        // Triangle envelope
+        //
+        // Prevents abrupt grain edges.
+        // ========================================================
+
+        int32_t env;
+
+        if (phase < HALF_GRAIN)
+        {
+            env = (phase * 4096) / HALF_GRAIN;
+        }
+        else
+        {
+            env =
+                ((GRAIN_SIZE - phase)
+                * 4096)
+                / HALF_GRAIN;
+        }
+
+        return (sample * env) >> 12;
+    }
+
+    // ============================================================
+    // Convert knob position to semitones
+    //
+    // 0      -> -12
+    // 2048   -> 0
+    // 4095   -> +12
+    // ============================================================
+
+    int32_t KnobToSemitones(int32_t value)
+    {
+        return ((value * 24) / 4095) - 12;
+    }
+
+    // ============================================================
+    // CV mapping
+    //
+    // Approximate:
+    // 1V = 12 semitones
+    // ============================================================
+
+    int32_t CVToSemitones(int32_t cv)
+    {
+        return (cv * 72) / 2048;
+    }
+
+    // ============================================================
+    // Quantiser
+    //
+    // Snaps incoming semitone values to nearest
+    // valid scale degree.
+    //
+    // This behaves like a continuous note selector
+    // rather than chromatic rounding.
+    // ============================================================
+
+    int32_t QuantisePitch(int32_t semitone)
+    {
+        int32_t octave = semitone / 12;
+
+        int32_t note = semitone % 12;
+
+        if (note < 0)
+        {
+            note += 12;
+            octave--;
+        }
+
+        const int8_t* scale;
+        int32_t size;
+
+        switch(currentScale)
+        {
+            case MAJOR:
+                scale = majorScale;
+                size = 7;
+                break;
+
+            case MINOR:
+                scale = minorScale;
+                size = 7;
+                break;
+
+            case PENTATONIC:
+                scale = pentScale;
+                size = 5;
+                break;
+
+            case MINOR_PENTATONIC:
+                scale = minorPentScale;
+                size = 5;
+                break;
+
+            case BLUES:
+                scale = bluesScale;
+                size = 6;
+                break;
+
+            case WHOLE_TONE:
+                scale = wholeToneScale;
+                size = 6;
+                break;
+
+            case CHROMATIC
+            default:
+                return semitone;
+        }
+
+        int32_t nearest = scale[0];
+        int32_t bestDist = 12;
+
+        for (int32_t i = 0; i < size; i++)
+        {
+            int32_t dist =
+                Abs(note - scale[i]);
+
+            // Wraparound correction.
+            //
+            // Example:
+            // distance from 11 -> 0
+            // should be 1 semitone,
+            // not 11 semitones.
+
+            if (dist > 6)
+            {
+                dist = 12 - dist;
+            }
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                nearest = scale[i];
+            }
+        }
+
+        return (octave * 12) + nearest;
+    }
+
+    // ============================================================
+    // Fixed-point playback ratios
+    //
+    // Precomputed for speed.
+    //
+    // Values are intentionally approximate and
+    // musically tuned rather than mathematically exact.
+    //
+    // Avoids expensive powf() in ISR.
+    // ============================================================
+
+    int32_t SemitoneToRatio(int32_t semitone)
+    {
+        static const int32_t ratios[25] =
+        {
+            32768,
+            34716,
+            36780,
+            38967,
+            41285,
+            43740,
+            46341,
+            49096,
+            52016,
+            55109,
+            58386,
+            61858,
+            65536,
+            69433,
+            73561,
+            77935,
+            82570,
+            87480,
+            92682,
+            98192,
+            104032,
+            110218,
+            116772,
+            123716,
+            131072
+        };
+
+        int32_t idx = semitone + 12;
+
+        if (idx < 0) idx = 0;
+        if (idx > 24) idx = 24;
+
+        return ratios[idx];
+    }
+
+    // ============================================================
+    // LED UI
+    // ============================================================
+
+    void UpdateLEDs(bool quantised)
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            LedOff(i);
+        }
+
+        // Unquantised mode:
+        // dim glow on all LEDs.
+
+        if (!quantised)
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                LedBrightness(i, 128);
+            }
+
+            return;
+        }
+
+        // Chromatic mode:
+        // all LEDs lit.
+
+        if (currentScale == CHROMATIC)
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                LedOn(i);
+            }
+
+            return;
+        }
+
+        // Other scales:
+        // one-hot LED display.
+
+        LedOn(static_cast<int>(currentScale));
+    }
+
+    // ============================================================
+    // Integer absolute value
+    // ============================================================
+
+    int32_t Abs(int32_t x)
+    {
+        return (x < 0) ? -x : x;
     }
 };
 
-// ============================================================
-// Scale definitions
-// ============================================================
-
-const int32_t
-DualQuantPitch::majorScale[7] =
-{
-    0, 2, 4, 5, 7, 9, 11
-};
-
-const int32_t
-DualQuantPitch::minorScale[7] =
-{
-    0, 2, 3, 5, 7, 8, 10
-};
-
-const int32_t
-DualQuantPitch::pentScale[5] =
-{
-    0, 2, 4, 7, 9
-};
-
-const int32_t
-DualQuantPitch::minorPentScale[5] =
-{
-    0, 3, 5, 7, 10
-};
-
-const int32_t
-DualQuantPitch::bluesScale[6] =
-{
-    0, 3, 5, 6, 7, 10
-};
-
-const int32_t
-DualQuantPitch::wholeToneScale[6] =
-{
-    0, 2, 4, 6, 8, 10
-};
-
-// ============================================================
-// Main entry point
-// ============================================================
-
 int main()
 {
-    set_sys_clock_khz(144000, true);
-
     DualQuantPitch card;
-
     card.Run();
 }
