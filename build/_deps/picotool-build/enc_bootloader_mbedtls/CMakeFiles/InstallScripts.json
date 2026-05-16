@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/adrianvos/Documents/GitHub/dual_quant/build/_deps/picotool-build/enc_bootloader_mbedtls/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
